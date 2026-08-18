@@ -107,9 +107,26 @@ def require_supported_model_version(config: dict, *, context: str = "checkpoint"
     return generation
 
 
+_CHECKPOINT_CONFIG_HOUSEKEEPING_KEYS = {"model_version", "gemma_source_checkpoint", "is_v2", "model_type"}
+
+
 def validate_strict_checkpoint_contract(config: dict, generation: tuple[int, int]) -> None:
-    """Validate generation-defining architecture metadata before construction."""
+    """Validate generation-defining architecture metadata before construction.
+
+    ``config`` may be the full checkpoint dict (with a ``"transformer"``
+    sub-dict) or the transformer-level dict itself with no wrapper key — the
+    same two shapes ``from_checkpoint_config`` already accepts for field
+    extraction (see ``test_accepts_bare_transformer_dict``). This mirrors that
+    same fallback so a bare-shape ``config.json`` is not rejected here after
+    already being accepted there — but only once it actually carries
+    transformer-shaped content beyond ``model_version``/housekeeping keys. A
+    config left nearly empty by an upstream parse failure (only
+    ``model_version`` present, everything else lost) must still fail loudly
+    here instead of silently validating against every field's default.
+    """
     transformer = config.get("transformer")
+    if transformer is None and any(key not in _CHECKPOINT_CONFIG_HOUSEKEEPING_KEYS for key in config):
+        transformer = config
     if not isinstance(transformer, dict):
         raise ValueError("checkpoint config.transformer is missing or invalid")
 
@@ -323,10 +340,21 @@ class LTXModelConfig:
         """Read the transformer config from a checkpoint directory.
 
         Prefers ``embedded_config.json`` (the richer config, includes
-        ``rope_type``) and falls back to ``config.json``. If neither is present
-        or parseable, warns on stderr and returns the hardcoded defaults — which
-        would reintroduce the ``av_ca_timestep_scale_multiplier`` bug, so the
-        warning is loud.
+        ``rope_type``) and falls back to ``config.json``. A candidate is only
+        accepted once it is both parseable JSON *and* passes the same strict
+        checkpoint validation ``from_checkpoint_config`` applies (declares a
+        supported ``model_version``, etc.) — a candidate that parses but fails
+        that validation (e.g. a stale ``embedded_config.json`` left over from
+        an older packaging pipeline, missing ``model_version``) is skipped in
+        favor of the next candidate rather than aborting the whole lookup.
+        This is what actually makes the two-name loop a fallback chain: a
+        prior version caught only JSON-parse failures here, so a config that
+        parsed fine but failed semantic validation propagated a ``ValueError``
+        straight out and never gave ``config.json`` a chance.
+
+        If no candidate is present, or none is parseable/valid, warns on
+        stderr and returns the hardcoded defaults — which would reintroduce
+        the ``av_ca_timestep_scale_multiplier`` bug, so the warning is loud.
 
         Args:
             model_dir: Directory containing the checkpoint config files.
@@ -338,16 +366,23 @@ class LTXModelConfig:
         from pathlib import Path
 
         model_dir = Path(model_dir)
+        last_error: Exception | None = None
         for name in ("embedded_config.json", "config.json"):
             path = model_dir / name if model_dir.is_dir() else model_dir.parent / name
             if not path.exists():
                 continue
             try:
-                return cls.from_checkpoint_config(json.loads(path.read_text()), strict=strict)
+                parsed = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError) as exc:
-                if strict:
-                    raise ValueError(f"failed to read transformer config {path}: {exc}") from exc
-                return cls()
+                last_error = exc
+                continue
+            try:
+                return cls.from_checkpoint_config(parsed, strict=strict)
+            except ValueError as exc:
+                # Parsed fine but failed strict checkpoint validation (e.g.
+                # no model_version). Try the next candidate before giving up.
+                last_error = exc
+                continue
 
         # Check for GGUF files in model_dir or direct file
         gguf_candidates = []
@@ -371,10 +406,15 @@ class LTXModelConfig:
                         cfg_json['transformer']['use_keyframes_abs_pos_embedding'] = True
                     cfg_json['gemma_source_checkpoint'] = {'gemma_version': 'gemma4-12b-ltx-v1'}
                     return cls.from_checkpoint_config(cfg_json, strict=strict)
-            except Exception:
-                pass
+            except Exception as exc:
+                last_error = exc
 
         if strict:
+            if last_error is not None:
+                raise ValueError(
+                    f"no usable transformer config (embedded_config.json / config.json / .gguf) "
+                    f"in {model_dir}: {last_error}"
+                ) from last_error
             raise FileNotFoundError(f"no transformer config (embedded_config.json / config.json / .gguf) found in {model_dir}")
         return cls()
 
